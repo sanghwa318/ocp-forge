@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OCP Installer</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <div class="sidebar-logo">
+        <div class="sidebar-logo-icon">
+          <svg viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="9" cy="9" r="7" stroke="white" stroke-width="1.5"/>
+            <path d="M5.5 9 L8 11.5 L12.5 6.5" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div class="sidebar-title">OCP Installer</div>
+      </div>
+      <div class="sidebar-cluster" id="cluster-label">클러스터 로딩 중...</div>
+    </div>
+    <nav class="nav">
+      <div class="nav-section">현황</div>
+      <div class="nav-item active" data-page="status"><span class="nav-dot"></span>대시보드</div>
+      <div class="nav-item" data-page="history"><span class="nav-dot"></span>실행 이력</div>
+      <div class="nav-section">설정</div>
+      <div class="nav-item" data-page="env-cluster"><span class="nav-dot"></span>클러스터</div>
+      <div class="nav-item" data-page="env-network"><span class="nav-dot"></span>네트워크</div>
+      <div class="nav-item" data-page="env-registry"><span class="nav-dot"></span>레지스트리</div>
+      <div class="nav-item" data-page="env-install_config"><span class="nav-dot"></span>Install Config</div>
+      <div class="nav-item" data-page="env-bastion"><span class="nav-dot"></span>Bastion</div>
+      <div class="nav-item" data-page="env-post"><span class="nav-dot"></span>Post</div>
+      <div class="nav-item" data-page="inventory"><span class="nav-dot"></span>인벤토리</div>
+      <div class="nav-section">실행</div>
+      <div class="nav-item" data-page="run-pre"><span class="nav-dot"></span>Pre</div>
+      <div class="nav-item" data-page="run-install"><span class="nav-dot"></span>Install</div>
+      <div class="nav-item" data-page="run-post"><span class="nav-dot"></span>Post</div>
+    </nav>
+  </aside>
+  <main class="main">
+    <div id="page-status"    class="page"></div>
+    <div id="page-env"       class="page hidden"></div>
+    <div id="page-inventory" class="page hidden"></div>
+    <div id="page-run"       class="page hidden"></div>
+    <div id="page-history"   class="page hidden"></div>
+  </main>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
