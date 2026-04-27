@@ -1,0 +1,19 @@
+[Unit]
+Description=OCP Forge Installer UI
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/ocp-forge/backend
+Environment=INSTALL_DIR=/root/ocp-tools/install
+ExecStart=/usr/libexec/platform-python /root/ocp-forge/backend/server.py --port 8081 --host 0.0.0.0
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ocp-forge
+
+[Install]
+WantedBy=multi-user.target

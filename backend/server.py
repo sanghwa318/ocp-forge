@@ -72,6 +72,7 @@ STEPS_META = {
 
 _jobs = {}
 _jobs_lock = threading.Lock()
+_procs = {}   # jid -> subprocess.Popen (실행 중인 프로세스 추적)
 
 
 def _load_history():
@@ -125,6 +126,7 @@ def run_script_thread(jid, cmd):
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             cwd=str(INSTALL_DIR)
         )
+        _procs[jid] = proc
         for raw in proc.stdout:
             append_log(jid, raw.decode("utf-8", errors="replace").rstrip())
         proc.wait()
@@ -132,6 +134,27 @@ def run_script_thread(jid, cmd):
     except Exception as e:
         append_log(jid, "[INTERNAL ERROR] {}".format(e))
         finish_job(jid, 1)
+    finally:
+        _procs.pop(jid, None)
+
+
+def kill_job(jid):
+    """실행 중인 job 강제 종료."""
+    proc = _procs.get(jid)
+    if proc is None:
+        return False
+    try:
+        proc.terminate()
+        def _force():
+            time.sleep(2)
+            try: proc.kill()
+            except Exception: pass
+        threading.Thread(target=_force, daemon=True).start()
+        append_log(jid, "[ABORT] 사용자 요청으로 강제 종료됨")
+        finish_job(jid, -1)
+        return True
+    except Exception:
+        return False
 
 
 # ── env 파서 ─────────────────────────────────────────────────────────
@@ -560,24 +583,44 @@ def _parse_cert_file(cert_path):
 
 
 def _get_registry_cert_path():
-    """실행 중인 registry 컨테이너가 마운트한 인증서 경로 추출."""
-    for rt in ("podman", "docker"):
-        try:
-            r = subprocess.run(
-                [rt, "inspect", "--format",
-                 "{{range .Mounts}}{{.Source}}:{{.Destination}}\n{{end}}",
-                 "infra_registry"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5
-            )
-            if r.returncode != 0:
+    """
+    레지스트리 인증서 경로 탐색 (2단계):
+    1) 실행 중인 컨테이너 마운트 경로 (podman inspect)
+    2) REGISTRIES_CSV의 각 디렉토리 내 certs/ 폴더 fallback
+    """
+    # 1단계: 컨테이너 inspect
+    reg_env = parse_env(ENV_FILES["registry"])
+    csv = reg_env.get("REGISTRIES_CSV", "infra_registry|/NFS/infra_registry|5000")
+    container_names = [e.split("|")[0].strip() for e in csv.split(",") if e.strip()]
+
+    for name in container_names:
+        for rt in ("podman", "docker"):
+            try:
+                r = subprocess.run(
+                    [rt, "inspect", "--format",
+                     "{{range .Mounts}}{{.Source}}:{{.Destination}}\n{{end}}", name],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5
+                )
+                if r.returncode != 0:
+                    continue
+                for line in r.stdout.decode().splitlines():
+                    src, _, dst = line.partition(":")
+                    if dst and ("/certs" in dst or "/pki" in dst) and src.endswith(".crt"):
+                        return src
+            except FileNotFoundError:
                 continue
-            for line in r.stdout.decode().splitlines():
-                src, _, dst = line.partition(":")
-                # 컨테이너 내 /certs/ 또는 /etc/pki/ 경로로 마운트된 cert
-                if dst and ("/certs" in dst or "/pki" in dst) and src.endswith(".crt"):
-                    return src
-        except FileNotFoundError:
+
+    # 2단계: REGISTRIES_CSV 디렉토리 내 certs/ fallback
+    cert_file = reg_env.get("CERT_FILE", "domain.crt")
+    for entry in csv.split(","):
+        parts = entry.strip().split("|")
+        if len(parts) < 2:
             continue
+        reg_dir = parts[1].strip()
+        candidate = Path(reg_dir) / "certs" / cert_file
+        if candidate.exists():
+            return str(candidate)
+
     return None
 
 
@@ -841,6 +884,227 @@ def analyze_inventory():
 
 # ── install workdir 상태 ─────────────────────────────────────────────
 
+
+
+# ── bootstrap 완료 폴링 ──────────────────────────────────────────────
+
+def get_bootstrap_status():
+    """
+    bootstrap 완료 여부 폴링.
+    - openshift-install wait-for bootstrap-complete 상태
+    - oc get nodes 결과
+    - CSR 대기 수
+    """
+    result = {
+        "oc_available": False,
+        "nodes":        [],
+        "pending_csrs": 0,
+        "api_reachable": False,
+    }
+
+    # API 서버 접근 확인
+    cl_env = parse_env(ENV_FILES["cluster"])
+    api_server = cl_env.get("API_SERVER", "")
+    if api_server:
+        try:
+            r = subprocess.run(
+                ["curl", "-sk", "--connect-timeout", "3",
+                 "{}/healthz".format(api_server)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5
+            )
+            result["api_reachable"] = (r.returncode == 0 and b"ok" in r.stdout.lower())
+        except Exception:
+            pass
+
+    # oc 명령 사용 가능 여부
+    try:
+        r = subprocess.run(
+            ["oc", "whoami"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5
+        )
+        result["oc_available"] = (r.returncode == 0)
+    except Exception:
+        pass
+
+    if not result["oc_available"]:
+        return result
+
+    # 노드 목록
+    try:
+        r = subprocess.run(
+            ["oc", "get", "nodes", "-o",
+             "custom-columns=NAME:.metadata.name,ROLE:.metadata.labels."
+             "node-role\.kubernetes\.io/master,STATUS:.status.conditions[-1].type,"
+             "READY:.status.conditions[-1].status", "--no-headers"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10
+        )
+        if r.returncode == 0:
+            for line in r.stdout.decode().splitlines():
+                parts = line.split()
+                if len(parts) >= 4:
+                    result["nodes"].append({
+                        "name":   parts[0],
+                        "master": parts[1] != "<none>",
+                        "status": parts[2],
+                        "ready":  parts[3] == "True",
+                    })
+    except Exception:
+        pass
+
+    # pending CSR 수
+    try:
+        r = subprocess.run(
+            ["oc", "get", "csr", "--no-headers"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10
+        )
+        if r.returncode == 0:
+            pending = [l for l in r.stdout.decode().splitlines() if "Pending" in l]
+            result["pending_csrs"] = len(pending)
+    except Exception:
+        pass
+
+    return result
+
+# ── PXE/GRUB 파일 확인 ───────────────────────────────────────────────
+
+def get_pxe_status():
+    """
+    인벤토리의 MAC 기준으로 PXE/GRUB 파일 생성 여부 확인.
+    """
+    hosts = parse_inventory(INVENTORY_FILE)
+    tftp_root = Path("/tftpboot")
+    pxe_dir   = tftp_root / "pxelinux.cfg"
+    results   = []
+
+    for h in hosts:
+        if h["role"] not in ("bootstrap", "master", "worker", "infra"):
+            continue
+        mac = h.get("mac", "").strip()
+        if not mac:
+            results.append({
+                "fqdn": h["fqdn"], "role": h["role"],
+                "mac": "", "pxe": False, "grub": False,
+                "pxe_path": "", "grub_path": "",
+            })
+            continue
+
+        mac_lower = mac.lower().replace(":", "-")
+        pxe_name  = "01-{}".format(mac_lower)
+        pxe_path  = pxe_dir / pxe_name
+        grub_path = tftp_root / "grub.cfg-{}".format(pxe_name)
+
+        results.append({
+            "fqdn":      h["fqdn"],
+            "role":      h["role"],
+            "mac":       mac,
+            "pxe":       pxe_path.exists(),
+            "grub":      grub_path.exists(),
+            "pxe_path":  str(pxe_path),
+            "grub_path": str(grub_path),
+        })
+
+    total = len(results)
+    done  = sum(1 for r in results if r["pxe"] and r["grub"])
+    return {"nodes": results, "total": total, "done": done}
+
+# ── 백업 파일 정리 ────────────────────────────────────────────────────
+
+_BAK_SEARCH_DIRS = [
+    "/etc/dhcp",
+    "/etc/named",
+    "/var/named",
+    "/etc/haproxy",
+    "/etc/keepalived",
+    "/etc/httpd",
+    "/etc/pki",
+    "/tftpboot",
+    "/var/lib/tftpboot",
+]
+
+_BAK_PATTERN = re.compile(r'^.+\.\d{14}\.bak$')
+
+
+def scan_bak_files():
+    """
+    .YYYYMMDDHHmmss.bak 패턴 파일을 INSTALL_DIR + 시스템 경로에서 탐색.
+    rglob 대신 iterdir 한 레벨만 — 권한 오류 방지.
+    """
+    search_dirs = [str(INSTALL_DIR)] + _BAK_SEARCH_DIRS
+    found = []
+    for d in search_dirs:
+        dp = Path(d)
+        if not dp.is_dir():
+            continue
+        try:
+            entries = list(dp.iterdir())
+        except (PermissionError, OSError):
+            continue
+        for f in entries:
+            try:
+                if not f.is_file():
+                    continue
+                if not _BAK_PATTERN.match(f.name):
+                    continue
+                orig_name = re.sub(r'\.\d{14}\.bak$', '', f.name)
+                ts_m = re.search(r'\.(\d{14})\.bak$', f.name)
+                ts = ts_m.group(1) if ts_m else ""
+                found.append({
+                    "path": str(f),
+                    "orig": str(f.parent / orig_name),
+                    "ts":   ts,
+                    "size": f.stat().st_size,
+                })
+            except (PermissionError, OSError):
+                continue
+    found.sort(key=lambda x: (x["orig"], x["ts"]))
+    return found
+
+
+def do_cleanup_bak(dry_run=True, keep=0):
+    """
+    백업 파일 정리.
+    dry_run=True: 삭제 목록만 반환
+    keep: 원본 파일별 최신 N개 유지 (0=전부 삭제)
+    """
+    files = scan_bak_files()
+
+    # 원본 기준 그룹핑 → 최신순 정렬
+    groups = {}
+    for f in files:
+        groups.setdefault(f["orig"], []).append(f)
+    for orig in groups:
+        groups[orig].sort(key=lambda x: x["ts"], reverse=True)
+
+    to_delete = []
+    to_keep   = []
+    for orig, baks in sorted(groups.items()):
+        for i, bak in enumerate(baks):
+            if keep > 0 and i < keep:
+                to_keep.append(bak)
+            else:
+                to_delete.append(bak)
+
+    deleted = []
+    errors  = []
+    if not dry_run:
+        for bak in to_delete:
+            try:
+                Path(bak["path"]).unlink()
+                deleted.append(bak)
+            except Exception as e:
+                errors.append({"path": bak["path"], "error": str(e)})
+
+    return {
+        "dry_run":     dry_run,
+        "to_delete":   to_delete,
+        "to_keep":     to_keep,
+        "deleted":     deleted,
+        "errors":      errors,
+        "total_size":  sum(b["size"] for b in to_delete),
+        "total_count": len(to_delete),
+    }
+
+
 def get_workdir_status():
     env = parse_env(ENV_FILES["install_config"])
     base = Path(env.get("INSTALL_BASE_DIR", "/root/growin"))
@@ -985,6 +1249,15 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/api/status/cert":
             self.send_json(get_cert_status())
 
+        elif p == "/api/cleanup/bak":
+            self.send_json(do_cleanup_bak(dry_run=True, keep=0))
+
+        elif p == "/api/status/pxe":
+            self.send_json(get_pxe_status())
+
+        elif p == "/api/status/bootstrap":
+            self.send_json(get_bootstrap_status())
+
         elif p.startswith("/api/preflight/"):
             mode = p[len("/api/preflight/"):]
             if mode not in PREFLIGHT_MAP:
@@ -1050,7 +1323,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         p = urlparse(self.path).path.rstrip("/")
 
-        if p.startswith("/api/run/step/"):
+        if p == "/api/cleanup/bak":
+            body    = self.read_body_json()
+            dry_run = body.get("dry_run", True)
+            keep    = int(body.get("keep", 0))
+            self.send_json(do_cleanup_bak(dry_run=dry_run, keep=keep))
+
+        elif p.startswith("/api/run/step/"):
             step = p[len("/api/run/step/"):]
             if step not in ALL_STEPS:
                 return self.send_error_json(404, "unknown step: {}".format(step))
@@ -1080,7 +1359,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         p = urlparse(self.path).path.rstrip("/")
-        if p.startswith("/api/run/jobs/"):
+        if p.startswith("/api/run/jobs/") and p.endswith("/kill"):
+            # 실행 중인 job 강제 종료
+            jid = p[len("/api/run/jobs/"):-len("/kill")]
+            with _jobs_lock:
+                if jid not in _jobs:
+                    return self.send_error_json(404, "job not found")
+            ok = kill_job(jid)
+            self.send_json({"killed": ok, "job_id": jid})
+        elif p.startswith("/api/run/jobs/"):
             jid = p[len("/api/run/jobs/"):]
             with _jobs_lock:
                 if jid not in _jobs:

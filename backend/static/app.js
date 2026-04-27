@@ -29,6 +29,7 @@ const ENV_CATEGORIES = {
     { title: '노드 수', badge: 'badge-gray', keys: ['CONTROL_PLANE_REPLICAS','COMPUTE_REPLICAS'] },
     { title: '이미지 미러', badge: 'badge-purple', keys: ['REGISTRY_HOSTNAME','IMAGE_MIRROR_HOST','IMAGE_MIRROR_PATH','IMAGE_SOURCE_RELEASE','IMAGE_SOURCE_CONTENT'] },
     { title: 'COS 파일', badge: 'badge-gray', keys: ['COS_SOURCE_DIR','COS_KERNEL_MATCH','COS_INITRAMFS_MATCH','COS_ROOTFS_MATCH'] },
+    { title: 'Ignition HTTP', badge: 'badge-blue', keys: ['IGNITION_HTTP_HOST','IGNITION_HTTP_PORT','IGNITION_BASE_URL'] },
     { title: 'MachineConfig 초기화', badge: 'badge-teal', keys: ['MC_INIT_ENABLE','MC_INIT_COPY_TO_MANIFESTS','MC_ENABLE_CHRONY','MC_ENABLE_REGISTRIES','MC_ENABLE_CORE_PASSWORD','MC_ENABLE_ROOT_PASSWORD','MC_ENABLE_THP'] },
     { title: '비밀번호', badge: 'badge-red', keys: ['MC_CORE_PASSWORD','MC_ROOT_PASSWORD'] },
     { title: 'Huge Pages (THP)', badge: 'badge-gray', keys: ['MC_THP_ISOLCPUS','MC_THP_HUGEPAGESZ','MC_THP_HUGEPAGES','MC_THP_DISABLE_TRANSPARENT_HUGEPAGE'] },
@@ -116,6 +117,9 @@ const VAR_DESC = {
   MC_THP_HUGEPAGES:'Huge Page 수량.',
   MC_THP_DISABLE_TRANSPARENT_HUGEPAGE:'Transparent Huge Page 비활성화 여부. yes/no',
   ROUTING_VIA_HOST:'OVN 라우팅을 호스트 네트워크 스택으로 처리. 5G CNF 환경 필요. true/false',
+  IGNITION_HTTP_HOST:'Ignition 파일을 서빙하는 HTTP 호스트. 기본: bastion FQDN.',
+  IGNITION_HTTP_PORT:'Ignition HTTP 서버 포트. 기본: 8080.',
+  IGNITION_BASE_URL:'Ignition 파일 기본 URL. 노드 부팅 시 이 주소로 ign 파일을 내려받음.',
   DISABLE_ROOT_SSH:'root SSH 로그인 비활성화 여부. yes/no',
   ROOT_PASSWORD:'root 계정 비밀번호.',
   EXTRA_USER_PASSWORD:'추가 사용자 비밀번호.',
@@ -302,7 +306,14 @@ async function renderStatus() {
     <div class="card"><div class="card-title">Install 작업 디렉토리</div>
       <div id="workdir-status">로딩 중...</div></div>
     <div class="card"><div class="card-title">인증서 상태</div>
-      <div id="cert-status">로딩 중...</div></div>`;
+      <div id="cert-status">로딩 중...</div></div>
+    <div class="card">
+      <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+        <span>백업 파일 (.bak)</span>
+        <button class="small amber" onclick="openCleanupModal()">정리하기</button>
+      </div>
+      <div id="bak-status">로딩 중...</div>
+    </div>`;
 
   // 클러스터 라벨
   try {
@@ -443,15 +454,53 @@ async function renderStatus() {
         ${regHtml}`;
     }
   } catch(e) { document.getElementById('cert-status').textContent='오류: '+e.message; }
+
+  // 백업 파일 스캔
+  try {
+    const bak = await api('GET', '/api/cleanup/bak');
+    const el = document.getElementById('bak-status');
+    if (bak.total_count === 0) {
+      el.innerHTML = `<div class="file-row">
+        <span style="color:var(--text3)">정리할 백업 파일 없음</span>
+        <span class="badge badge-green">깨끗함</span></div>`;
+    } else {
+      const mb = (bak.total_size / 1048576).toFixed(1);
+      // 원본 기준 그룹 집계
+      const groups = {};
+      bak.to_delete.forEach(f => {
+        groups[f.orig] = (groups[f.orig]||0) + 1;
+      });
+      el.innerHTML = `
+        <div class="file-row" style="margin-bottom:8px">
+          <span style="color:var(--amber);font-weight:600">백업 파일 ${bak.total_count}개 발견</span>
+          <span class="badge badge-amber">${mb} MB</span>
+        </div>
+        ${Object.entries(groups).slice(0,5).map(([orig, cnt]) =>
+          `<div class="file-row" style="padding:5px 10px">
+            <span class="file-path">${escHtml(orig)}</span>
+            <span class="badge badge-gray">${cnt}개</span>
+          </div>`).join('')}
+        ${Object.keys(groups).length > 5
+          ? `<div style="font-size:11px;color:var(--text3);padding:4px 10px">... 외 ${Object.keys(groups).length-5}개 파일</div>` : ''}`;
+    }
+  } catch(e) { document.getElementById('bak-status').textContent='오류: '+e.message; }
 }
 
 // ── ENV 편집 ──────────────────────────────────────────────────────────
 async function renderEnv(name, title) {
   clearDirty();
+  const _LOAD_ORDER = {cluster:1,network:2,registry:3,bastion:4,install_config:5,post:6};
+  const loadOrder = _LOAD_ORDER[name] || '?';
   document.getElementById('page-env').innerHTML = `
     <div class="page-header">
-      <div><div class="page-title">${title}</div>
-           <div class="page-desc">${name}.env 파일 편집</div></div>
+      <div>
+        <div class="page-title">${title}</div>
+        <div class="page-desc" style="display:flex;align-items:center;gap:8px;margin-top:4px">
+          <span>${name}.env</span>
+          <span class="badge badge-gray">로드 순서 ${loadOrder}/6</span>
+          <span style="font-size:11px;color:var(--text3)">— 이전 번호 env 변수를 참조 가능</span>
+        </div>
+      </div>
       <span id="dirty-badge" class="badge badge-amber hidden">미저장</span>
     </div>
     <div id="env-form"><div class="card" style="color:var(--text3)">로딩 중...</div></div>`;
@@ -573,6 +622,13 @@ async function renderInventory() {
           <tbody id="inv-tbody">로딩 중...</tbody>
         </table>
       </div>
+    </div>
+    <div class="card" style="margin-top:0">
+      <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+        <span>PXE / GRUB 파일 상태</span>
+        <button class="small" onclick="renderInventory()">새로고침</button>
+      </div>
+      <div id="pxe-status">로딩 중...</div>
     </div>`;
   try {
     const {hosts} = await api('GET','/api/inventory');
@@ -581,6 +637,31 @@ async function renderInventory() {
     document.getElementById('inv-tbody').innerHTML=
       `<tr><td colspan="10">오류: ${e.message}</td></tr>`;
   }
+
+  try {
+    const pxe = await api('GET', '/api/status/pxe');
+    const pxeEl = document.getElementById('pxe-status');
+    if (!pxeEl) return;
+    if (pxe.total === 0) {
+      pxeEl.innerHTML='<span style="color:var(--text3)">인벤토리 노드 없음</span>'; return;
+    }
+    const nodeRows = pxe.nodes.map(n =>
+      '<tr><td style="font-family:monospace;font-size:11px">'+escHtml(n.fqdn)+'</td>'+
+      '<td><span class="badge badge-gray">'+n.role+'</span></td>'+
+      '<td style="font-family:monospace;font-size:11px">'+escHtml(n.mac||'-')+'</td>'+
+      '<td><span class="badge '+(n.pxe?'badge-green':'badge-red')+'">'+(n.pxe?'✓':'없음')+'</span></td>'+
+      '<td><span class="badge '+(n.grub?'badge-green':'badge-red')+'">'+(n.grub?'✓':'없음')+'</span></td></tr>'
+    ).join('');
+    pxeEl.innerHTML =
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">'+
+        '<span class="badge '+(pxe.done===pxe.total?'badge-green':'badge-amber')+'">'+pxe.done+' / '+pxe.total+' 완료</span>'+
+        '<span style="font-size:11px;color:var(--text3)">11-pxe-grub-render 실행 후 갱신</span></div>'+
+      '<table style="width:100%"><thead><tr><th>FQDN</th><th>역할</th><th>MAC</th><th>PXE</th><th>GRUB</th></tr></thead>'+
+      '<tbody>'+nodeRows+'</tbody></table>';
+  } catch(e) {
+    const pxeEl = document.getElementById('pxe-status');
+    if (pxeEl) pxeEl.textContent = '오류: '+e.message;
+  }
 }
 
 function renderInvRows() {
@@ -588,7 +669,11 @@ function renderInvRows() {
   if (!tbody) return;
   tbody.innerHTML=_hosts.map((h,i)=>`<tr>
     <td><input value="${escHtml(h.fqdn)}"          onchange="updateHost(${i},'fqdn',this.value)"></td>
-    <td><input value="${escHtml(h.role)}"          onchange="updateHost(${i},'role',this.value)"></td>
+    <td><select onchange="updateHost(${i},'role',this.value)"
+      style="font-size:12px;border:none;background:transparent;color:var(--text);width:100%">
+      ${['bastion','bootstrap','master','worker','infra'].map(v=>
+        `<option ${h.role===v?'selected':''}>${v}</option>`).join('')}
+    </select></td>
     <td><input value="${escHtml(h.ip)}"            onchange="updateHost(${i},'ip',this.value)"></td>
     <td><input value="${escHtml(h.gateway||'')}"   onchange="updateHost(${i},'gateway',this.value)"></td>
     <td><input value="${escHtml(h.nic)}"           onchange="updateHost(${i},'nic',this.value)"></td>
@@ -656,7 +741,10 @@ async function renderRun(mode) {
         <div class="run-title">${m.title}</div>
         <div class="page-desc">${m.desc}</div>
       </div>
-      <button class="primary" onclick="runAll('${mode}')">전체 실행</button>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button id="kill-btn" class="danger" style="display:none">실행 중단</button>
+        <button class="primary" onclick="runAll('${mode}')">전체 실행</button>
+      </div>
     </div>
 
     ${pf ? `<div class="card" style="margin-top:16px">
@@ -682,6 +770,16 @@ async function renderRun(mode) {
       ${groupsHtml}
     </div>
 
+    ${mode==='install' ? `
+    <div class="card" style="margin-top:0">
+      <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+        <span>Bootstrap / 클러스터 상태</span>
+        <button class="small" onclick="refreshBootstrap()">새로고침</button>
+      </div>
+      <div id="bootstrap-status">
+        <span style="color:var(--text3);font-size:12px">새로고침으로 상태 확인</span>
+      </div>
+    </div>` : ''}
     <div class="card">
       <div class="log-header">
         <div class="card-title" style="margin:0">실행 로그</div>
@@ -738,6 +836,16 @@ function setBadge(b,r,status){
   const [t,c]=m[status]||['대기','badge-gray'];
   b.textContent=t; b.className='badge '+c;
   r.className='step-row '+(status==='pending'?'':status);
+}
+
+async function killJob(jobId) {
+  if (!confirm('실행 중인 job을 강제 종료하시겠습니까?')) return;
+  try {
+    await api('DELETE', '/api/run/jobs/'+jobId+'/kill');
+    toast('job 종료됨', 'ok');
+    updateKillBtn(false);
+    renderHistory();
+  } catch(e) { toast('종료 실패: '+e.message, 'err'); }
 }
 
 // ── 실행 이력 ─────────────────────────────────────────────────────────
@@ -805,6 +913,33 @@ async function deleteJob(jobId){
     await api('DELETE','/api/run/jobs/'+jobId);
     renderHistory(); toast('삭제됨','ok');
   } catch(e){ toast('삭제 실패: '+e.message,'err'); }
+}
+
+async function refreshBootstrap() {
+  const el = document.getElementById('bootstrap-status');
+  if (!el) return;
+  el.innerHTML = '<span style="color:var(--text3);font-size:12px">확인 중...</span>';
+  try {
+    const bs = await api('GET', '/api/status/bootstrap');
+    const apiColor = bs.api_reachable ? 'badge-green' : 'badge-red';
+    const ocColor  = bs.oc_available  ? 'badge-green' : 'badge-red';
+    const nodeRows = bs.nodes.map(n =>
+      '<tr><td style="font-family:monospace;font-size:11px">'+escHtml(n.name)+'</td>'+
+      '<td><span class="badge '+(n.master?'badge-purple':'badge-gray')+'">'+(n.master?'master':'worker')+'</span></td>'+
+      '<td style="font-size:11px">'+escHtml(n.status)+'</td>'+
+      '<td><span class="badge '+(n.ready?'badge-green':'badge-amber')+'">'+(n.ready?'Ready':'NotReady')+'</span></td></tr>'
+    ).join('');
+    el.innerHTML =
+      '<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">'+
+        '<span class="badge '+apiColor+'">API '+(bs.api_reachable?'응답':'미응답')+'</span>'+
+        '<span class="badge '+ocColor+'">oc '+(bs.oc_available?'로그인됨':'로그인 필요')+'</span>'+
+        (bs.pending_csrs>0 ? '<span class="badge badge-amber">CSR 대기 '+bs.pending_csrs+'건</span>' :
+         bs.oc_available   ? '<span class="badge badge-green">CSR 대기 없음</span>' : '')+
+      '</div>'+
+      (bs.nodes.length>0 ?
+        '<table style="width:100%"><thead><tr><th>노드</th><th>역할</th><th>상태</th><th>Ready</th></tr></thead><tbody>'+nodeRows+'</tbody></table>' :
+        (bs.oc_available ? '<div style="color:var(--text3);font-size:12px">노드 없음</div>' : ''));
+  } catch(e) { el.textContent = '오류: '+e.message; }
 }
 
 // ── 인벤토리 분석 ─────────────────────────────────────────────────────
@@ -894,6 +1029,108 @@ async function applyAnalyze(){
   document.getElementById('analyze-modal').remove();
   toast(failed===0 ? saved+'개 env 파일에 반영됨' : saved+'개 성공, '+failed+'개 실패',
         failed===0 ? 'ok' : 'err');
+}
+
+
+// ── 백업 파일 정리 모달 ───────────────────────────────────────────────
+
+async function openCleanupModal() {
+  // 스캔
+  let bak;
+  try {
+    bak = await api('POST', '/api/cleanup/bak', {dry_run: true, keep: 0});
+  } catch(e) { toast('스캔 실패: '+e.message, 'err'); return; }
+
+  const modal = document.createElement('div');
+  modal.className = 'log-modal-wrap';
+  modal.id = 'cleanup-modal';
+
+  // 원본 기준 그룹핑
+  const groups = {};
+  bak.to_delete.forEach(f => {
+    if (!groups[f.orig]) groups[f.orig] = [];
+    groups[f.orig].push(f);
+  });
+
+  const groupRows = Object.entries(groups).map(([orig, files]) => {
+    const totalSize = files.reduce((s,f)=>s+f.size, 0);
+    const mb = (totalSize/1048576).toFixed(2);
+    return `<div style="margin-bottom:10px">
+      <div class="analyze-row">
+        <div style="flex:1">
+          <div class="file-name">${escHtml(orig.split('/').pop())}</div>
+          <div class="file-path">${escHtml(orig)}</div>
+        </div>
+        <span class="badge badge-amber">${files.length}개 / ${mb} MB</span>
+      </div>
+      <div style="padding:4px 10px 0">
+        ${files.sort((a,b)=>b.ts.localeCompare(a.ts)).map((f,i) => {
+          const ts = f.ts;
+          const fmt = ts.slice(0,4)+'-'+ts.slice(4,6)+'-'+ts.slice(6,8)+' '+
+                      ts.slice(8,10)+':'+ts.slice(10,12)+':'+ts.slice(12,14);
+          return `<div style="font-size:11px;font-family:monospace;color:var(--text3);
+                              padding:2px 0;display:flex;justify-content:space-between">
+            <span>${escHtml(f.path.split('/').pop())}</span>
+            <span>${fmt}</span>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>`;
+  }).join('');
+
+  const mb_total = (bak.total_size/1048576).toFixed(1);
+
+  modal.innerHTML = `
+    <div class="log-modal" style="max-height:80vh;display:flex;flex-direction:column">
+      <div class="log-modal-header">
+        <span>백업 파일 정리 — ${bak.total_count}개 / ${mb_total} MB</span>
+        <button class="small" onclick="document.getElementById('cleanup-modal').remove()">닫기</button>
+      </div>
+      <div style="flex:1;overflow-y:auto;padding:16px">
+        ${bak.total_count === 0
+          ? '<div style="color:var(--text3);padding:8px">정리할 백업 파일이 없습니다.</div>'
+          : `<div style="font-size:12px;color:var(--text2);margin-bottom:14px;padding:10px 12px;
+                         background:var(--amber-bg);border-radius:var(--radius);
+                         border-left:3px solid var(--amber)">
+               아래 파일들이 삭제됩니다. 삭제 후 복구 불가합니다.
+             </div>
+             ${groupRows}`}
+      </div>
+      <div style="padding:12px 16px;border-top:0.5px solid var(--border);
+                  display:flex;justify-content:space-between;align-items:center;
+                  background:var(--bg3)">
+        <div style="display:flex;align-items:center;gap:10px">
+          <label style="font-size:12px;display:flex;align-items:center;gap:6px">
+            <span style="color:var(--text2)">최신</span>
+            <input type="number" id="cleanup-keep" value="0" min="0" max="10"
+                   style="width:50px;padding:4px 8px;border:0.5px solid var(--border2);
+                          border-radius:6px;font-size:12px">
+            <span style="color:var(--text2)">개 유지</span>
+          </label>
+          <span style="font-size:11px;color:var(--text3)">(0 = 전부 삭제)</span>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button onclick="document.getElementById('cleanup-modal').remove()">취소</button>
+          <button class="danger" onclick="doCleanup()" ${bak.total_count===0?'disabled':''}>
+            ${bak.total_count}개 삭제
+          </button>
+        </div>
+      </div>
+    </div>`;
+
+  document.body.appendChild(modal);
+}
+
+async function doCleanup() {
+  const keep = parseInt(document.getElementById('cleanup-keep')?.value || '0');
+  try {
+    const result = await api('POST', '/api/cleanup/bak', {dry_run: false, keep});
+    document.getElementById('cleanup-modal')?.remove();
+    const errMsg = result.errors.length ? ` (오류 ${result.errors.length}건)` : '';
+    toast(`${result.deleted.length}개 삭제 완료${errMsg}`, result.errors.length ? 'err' : 'ok');
+    // 대시보드 새로고침
+    renderStatus();
+  } catch(e) { toast('삭제 실패: '+e.message, 'err'); }
 }
 
 // ── 초기화 ────────────────────────────────────────────────────────────
