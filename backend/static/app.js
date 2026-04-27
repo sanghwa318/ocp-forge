@@ -18,7 +18,8 @@ const ENV_CATEGORIES = {
     { title: '인증서', badge: 'badge-amber', keys: ['CERT_DIR','CERT_FILE','KEY_FILE','CERT_IF_EXISTS'] },
   ],
   bastion: [
-    { title: '사용자 계정', badge: 'badge-blue', keys: ['CREATE_EXTRA_USER','EXTRA_USER_NAME','EXTRA_USER_GROUPS','EXTRA_USER_SUDO_NOPASSWD'] },
+    { title: 'SSH / Root', badge: 'badge-red', keys: ['DISABLE_ROOT_SSH','ROOT_PASSWORD'] },
+    { title: '사용자 계정', badge: 'badge-blue', keys: ['CREATE_EXTRA_USER','EXTRA_USER_NAME','EXTRA_USER_GROUPS','EXTRA_USER_SUDO_NOPASSWD','EXTRA_USER_PASSWORD'] },
     { title: 'oc 자동 로그인', badge: 'badge-teal', keys: ['ENABLE_OC_AUTO_LOGIN','OC_LOGIN_USER','OC_LOGIN_PASSWORD','OC_LOGIN_SERVER'] },
   ],
   install_config: [
@@ -33,7 +34,9 @@ const ENV_CATEGORIES = {
     { title: 'Huge Pages (THP)', badge: 'badge-gray', keys: ['MC_THP_ISOLCPUS','MC_THP_HUGEPAGESZ','MC_THP_HUGEPAGES','MC_THP_DISABLE_TRANSPARENT_HUGEPAGE'] },
   ],
   post: [
+    { title: 'Ingress', badge: 'badge-blue', keys: ['INGRESS_REPLICAS','TARGET_NODE_ROLE_KEY','TARGET_TOLERATION_KEY','TARGET_TOLERATION_EFFECT'] },
     { title: 'OVN 네트워크', badge: 'badge-purple', keys: ['ROUTING_VIA_HOST','IP_FORWARDING_MODE'] },
+    { title: 'OperatorHub 카탈로그', badge: 'badge-teal', keys: ['DISABLE_ALL_DEFAULT_SOURCES','ENABLE_REDHAT_OPERATORS','ENABLE_COMMUNITY_OPERATORS','ENABLE_CERTIFIED_OPERATORS','ENABLE_MARKETPLACE_OPERATORS'] },
   ],
 };
 
@@ -113,6 +116,18 @@ const VAR_DESC = {
   MC_THP_HUGEPAGES:'Huge Page 수량.',
   MC_THP_DISABLE_TRANSPARENT_HUGEPAGE:'Transparent Huge Page 비활성화 여부. yes/no',
   ROUTING_VIA_HOST:'OVN 라우팅을 호스트 네트워크 스택으로 처리. 5G CNF 환경 필요. true/false',
+  DISABLE_ROOT_SSH:'root SSH 로그인 비활성화 여부. yes/no',
+  ROOT_PASSWORD:'root 계정 비밀번호.',
+  EXTRA_USER_PASSWORD:'추가 사용자 비밀번호.',
+  INGRESS_REPLICAS:'Ingress 컨트롤러 replica 수. master 수와 맞추는 게 일반적.',
+  TARGET_NODE_ROLE_KEY:'Ingress를 배치할 노드 역할 라벨.',
+  TARGET_TOLERATION_KEY:'Ingress 배치 시 toleration key.',
+  TARGET_TOLERATION_EFFECT:'Ingress 배치 시 toleration effect.',
+  DISABLE_ALL_DEFAULT_SOURCES:'기본 OperatorHub 카탈로그 소스 전체 비활성화. true/false',
+  ENABLE_REDHAT_OPERATORS:'Red Hat Operators 카탈로그 활성화. true/false',
+  ENABLE_COMMUNITY_OPERATORS:'Community Operators 카탈로그 활성화. true/false',
+  ENABLE_CERTIFIED_OPERATORS:'Certified Operators 카탈로그 활성화. true/false',
+  ENABLE_MARKETPLACE_OPERATORS:'Marketplace Operators 카탈로그 활성화. true/false',
   IP_FORWARDING_MODE:'IP 포워딩 모드. Global=전체 활성화, Restricted=제한적 활성화.',
 };
 

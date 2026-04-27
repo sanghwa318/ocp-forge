@@ -193,6 +193,14 @@ def parse_env(path):
 
 def write_env(path, data, original_path=None):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
+    # 기존 파일 백업 (.bak)
+    if Path(path).exists():
+        bak = str(path) + ".bak"
+        try:
+            import shutil
+            shutil.copy2(path, bak)
+        except Exception:
+            pass
     src = original_path if (original_path and Path(original_path).exists()) else None
     if src:
         with open(src) as f:
@@ -274,6 +282,21 @@ def container_status(name):
     return "unknown"
 
 
+def registry_containers_status():
+    """REGISTRIES_CSV에서 레지스트리 이름 목록 파싱 후 상태 반환."""
+    reg_env = parse_env(ENV_FILES["registry"])
+    csv = reg_env.get("REGISTRIES_CSV", "infra_registry|/NFS/infra_registry|5000")
+    result = {}
+    for entry in csv.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split("|")
+        name = parts[0].strip() if parts else entry
+        result[name] = container_status(name)
+    return result
+
+
 # ── Preflight Check ──────────────────────────────────────────────────
 
 def preflight_pre():
@@ -321,12 +344,31 @@ def preflight_pre():
                   else "없음: {}".format(", ".join(missing)),
     })
 
-    # grubx64.efi
-    grub = Path("/media/EFI/BOOT/grubx64.efi")
+    # ISO 마운트 및 grubx64.efi 체크
+    # /media 또는 /mnt 중 하나에 ISO가 마운트되어 있는지 확인
+    grub_candidates = [
+        Path("/media/EFI/BOOT/grubx64.efi"),
+        Path("/mnt/EFI/BOOT/grubx64.efi"),
+    ]
+    grub_found = next((p for p in grub_candidates if p.exists()), None)
+    # /mnt 마운트 여부 (ISO 마운트 감지)
+    mnt_mounted = False
+    try:
+        r = subprocess.run(["findmnt", "-n", "-o", "SOURCE", "/mnt"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
+        mnt_mounted = r.returncode == 0 and bool(r.stdout.decode().strip())
+    except Exception:
+        pass
     checks.append({
-        "name": "grubx64.efi (ISO mount)",
-        "ok": grub.exists(),
-        "detail": "존재" if grub.exists() else "/media 에 ISO 마운트 필요",
+        "name": "설치 ISO 마운트 (/mnt)",
+        "ok": mnt_mounted,
+        "detail": "마운트됨" if mnt_mounted else "/mnt 에 ISO 마운트 필요 (mount /dev/sr0 /mnt)",
+    })
+    checks.append({
+        "name": "grubx64.efi",
+        "ok": grub_found is not None,
+        "detail": "존재: {}".format(grub_found) if grub_found
+                  else "/media/EFI/BOOT/grubx64.efi 또는 /mnt/EFI/BOOT/grubx64.efi 없음",
     })
 
     # pull-secret
@@ -539,83 +581,109 @@ def _get_registry_cert_path():
     return None
 
 
+def _wildcard_covers(wildcard, fqdn):
+    """
+    wildcard가 fqdn을 커버하는지 확인.
+    *.a.b.c 는 x.a.b.c 는 커버하지만 x.y.a.b.c 는 커버 안 함 (RFC 2818).
+    """
+    if not wildcard.startswith("*."):
+        return wildcard == fqdn
+    wc_suffix = wildcard[1:]   # .a.b.c
+    if not fqdn.endswith(wc_suffix):
+        return False
+    prefix = fqdn[: len(fqdn) - len(wc_suffix)]
+    return "." not in prefix and len(prefix) > 0
+
+
 def get_cert_status():
     """
     env 설정 기반 인증서 파일 읽기 + hosts.txt / 레지스트리와 비교.
     """
-    reg_env  = parse_env(ENV_FILES["registry"])
-    cert_dir  = reg_env.get("CERT_DIR", "/etc/pki/tls/certs")
-    cert_file = reg_env.get("CERT_FILE", "registry.crt")
-    cert_path = str(Path(cert_dir) / cert_file)
+    reg_env   = parse_env(ENV_FILES["registry"])
+    cert_dir  = reg_env.get("CERT_DIR", "./certs")
+    cert_file = reg_env.get("CERT_FILE", "domain.crt")
+
+    # CERT_DIR 상대경로 → INSTALL_DIR 기준 절대경로로 변환
+    cert_dir_path = Path(cert_dir)
+    if not cert_dir_path.is_absolute():
+        cert_dir_path = (INSTALL_DIR / cert_dir_path).resolve()
+    cert_path = str(cert_dir_path / cert_file)
 
     result = {
-        "cert_path":    cert_path,
-        "cert_exists":  Path(cert_path).exists(),
-        "cert_info":    None,
-        "warnings":     [],
-        "registry_cert_path":   None,
-        "registry_cert_info":   None,
-        "registry_cert_match":  None,
+        "cert_path":   cert_path,
+        "cert_exists": Path(cert_path).exists(),
+        "cert_info":   None,
+        "warnings":    [],
+        "registry_cert_path":  None,
+        "registry_cert_info":  None,
+        "registry_cert_match": None,
     }
 
     if not result["cert_exists"]:
         return result
 
-    # 인증서 파싱
     info = _parse_cert_file(cert_path)
     result["cert_info"] = info
 
     if info.get("error"):
         return result
 
-    # hosts.txt에서 FQDN 목록 추출
-    hosts = parse_inventory(INVENTORY_FILE)
-    host_fqdns  = [h["fqdn"] for h in hosts if h.get("fqdn")]
-    host_shorts = [f.split(".")[0] for f in host_fqdns]
-    cert_dns    = info.get("dns_names", [])
-    cert_cn     = info.get("cn", "")
+    cert_dns = info.get("dns_names", [])
+    cert_cn  = info.get("cn", "")
 
-    # CN / DNS 불일치 체크
-    # 인증서의 CN이 bastion FQDN이나 shortname을 포함하는지
-    bastions = [h for h in hosts if h["role"] == "bastion"]
-    if bastions:
-        b_fqdn  = bastions[0]["fqdn"]
-        b_short = b_fqdn.split(".")[0]
-        # CN 체크
-        if cert_cn and b_short not in cert_cn and b_fqdn not in cert_cn:
+    # ── env에서 기대 패턴 계산 (04-make-certs.sh 로직 그대로) ────────
+    cl_env       = parse_env(ENV_FILES["cluster"])
+    host         = cl_env.get("HOST", "")
+    cluster_name = cl_env.get("CLUSTER_NAME", "")
+    base_domain  = cl_env.get("BASE_DOMAIN", "")
+
+    if host and cluster_name and base_domain:
+        name         = "{}.{}".format(cluster_name, base_domain)
+        expected_cn  = "{}.{}".format(host, name)          # bastion.lgu.example.co.kr
+        expected_san = [
+            "*.{}".format(name),                           # *.lgu.example.co.kr
+            "{}.{}".format(host, name),                    # bastion.lgu.example.co.kr
+        ]
+
+        # CN 체크 — 기대 CN과 비교
+        if cert_cn and cert_cn != expected_cn:
             result["warnings"].append(
-                "CN 불일치: 인증서 CN='{}' 이지만 bastion='{}'".format(cert_cn, b_fqdn))
-        # DNS SAN 체크
-        if cert_dns:
-            missing = [f for f in [b_fqdn, b_short] if f not in cert_dns]
-            # wildcard 체크
-            env = parse_env(ENV_FILES["cluster"])
-            cluster = env.get("CLUSTER_NAME","")
-            domain  = env.get("BASE_DOMAIN","")
-            if cluster and domain:
-                wildcard = "*.{}.{}".format(cluster, domain)
-                if wildcard not in cert_dns and b_fqdn not in cert_dns:
-                    result["warnings"].append(
-                        "DNS SAN 불일치: 인증서에 bastion FQDN({}) 없음. SAN={}".format(
-                            b_fqdn, ", ".join(cert_dns)))
+                "CN 불일치: 인증서 CN='{}' / 기대값='{}'".format(cert_cn, expected_cn))
 
-    # 레지스트리 컨테이너 인증서 비교
+        # SAN 체크 — 기대 SAN 항목이 인증서에 있는지
+        # wildcard 실제 매칭으로 확인
+        san_missing = []
+        for exp in expected_san:
+            # 직접 일치 또는 cert_dns 중 하나가 exp를 커버하는지
+            covered = (
+                exp in cert_dns or
+                any(_wildcard_covers(cd, exp) for cd in cert_dns if cd.startswith("*.")) or
+                (exp.startswith("*.") and exp in cert_dns)
+            )
+            if not covered:
+                san_missing.append(exp)
+
+        if san_missing:
+            result["warnings"].append(
+                "DNS SAN 불일치: 인증서에 없는 항목 — {}  (현재 SAN: {})".format(
+                    ", ".join(san_missing), ", ".join(cert_dns) or "없음"))
+
+    # ── 레지스트리 컨테이너 인증서 비교 ─────────────────────────────
     reg_cert_path = _get_registry_cert_path()
     if reg_cert_path and Path(reg_cert_path).exists():
         result["registry_cert_path"] = reg_cert_path
         reg_info = _parse_cert_file(reg_cert_path)
         result["registry_cert_info"] = reg_info
-        # 두 인증서의 CN + not_after 비교로 동일 여부 판단
         if not reg_info.get("error"):
             same = (
-                reg_info.get("cn") == info.get("cn") and
+                reg_info.get("cn")        == info.get("cn") and
                 reg_info.get("not_after") == info.get("not_after")
             )
             result["registry_cert_match"] = same
             if not same:
                 result["warnings"].append(
                     "레지스트리 컨테이너가 다른 인증서 사용 중: CN='{}' (설정: CN='{}')".format(
-                        reg_info.get("cn",""), info.get("cn","")))
+                        reg_info.get("cn", ""), info.get("cn", "")))
 
     return result
 
@@ -872,7 +940,9 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/api/status":
             svcs = {s: service_status(s)
                     for s in ["named", "haproxy", "dhcpd", "httpd", "keepalived"]}
-            svcs["registry_container"] = container_status("infra_registry")
+            # REGISTRIES_CSV 기반 복수 레지스트리 상태
+            for name, status in registry_containers_status().items():
+                svcs[name] = status
             self.send_json({"services": svcs})
 
         elif p == "/api/status/files":
