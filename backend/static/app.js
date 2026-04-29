@@ -30,7 +30,7 @@ const ENV_CATEGORIES = {
     { title: '이미지 미러', badge: 'badge-purple', keys: ['REGISTRY_HOSTNAME','IMAGE_MIRROR_HOST','IMAGE_MIRROR_PATH','IMAGE_SOURCE_RELEASE','IMAGE_SOURCE_CONTENT'] },
     { title: 'COS 파일', badge: 'badge-gray', keys: ['COS_SOURCE_DIR','COS_KERNEL_MATCH','COS_INITRAMFS_MATCH','COS_ROOTFS_MATCH'] },
     { title: 'Ignition HTTP', badge: 'badge-blue', keys: ['IGNITION_HTTP_HOST','IGNITION_HTTP_PORT','IGNITION_BASE_URL'] },
-    { title: 'MachineConfig 초기화', badge: 'badge-teal', keys: ['MC_INIT_ENABLE','MC_INIT_COPY_TO_MANIFESTS','MC_ENABLE_CHRONY','MC_ENABLE_REGISTRIES','MC_ENABLE_CORE_PASSWORD','MC_ENABLE_ROOT_PASSWORD','MC_ENABLE_THP','MC_ENABLE_STATIC'] },
+    { title: 'MachineConfig 초기화', badge: 'badge-teal', keys: ['MC_INIT_ENABLE','MC_INIT_COPY_TO_MANIFESTS','MC_ENABLE_CHRONY','MC_ENABLE_REGISTRIES','MC_ENABLE_CORE_PASSWORD','MC_ENABLE_ROOT_PASSWORD','MC_ENABLE_THP'] },
     { title: '비밀번호', badge: 'badge-red', keys: ['MC_CORE_PASSWORD','MC_ROOT_PASSWORD'] },
     { title: 'Huge Pages (THP)', badge: 'badge-gray', keys: ['MC_THP_ISOLCPUS','MC_THP_HUGEPAGESZ','MC_THP_HUGEPAGES','MC_THP_DISABLE_TRANSPARENT_HUGEPAGE'] },
   ],
@@ -110,7 +110,6 @@ const VAR_DESC = {
   MC_ENABLE_CORE_PASSWORD:'core 사용자 비밀번호 설정 여부. yes/no',
   MC_ENABLE_ROOT_PASSWORD:'root 사용자 비밀번호 설정 여부. yes/no',
   MC_ENABLE_THP:'Huge Pages 설정 MachineConfig 적용 여부. yes/no',
-  MC_ENABLE_STATIC:'iscsi-scan-add / multipath / ssh-password-login / timezone 등 static MC 파일을 mc_init/ 에서 manifests로 복사. yes/no',
   MC_CORE_PASSWORD:'core 사용자 비밀번호 (평문 입력, 스크립트가 해시 처리).',
   MC_ROOT_PASSWORD:'root 사용자 비밀번호 (평문 입력, 스크립트가 해시 처리).',
   MC_THP_ISOLCPUS:'Huge Pages용 CPU 격리 설정.',
@@ -582,14 +581,21 @@ async function renderEnv(name, title) {
 
 async function saveEnv(name) {
   const data = {};
-  document.querySelectorAll('[id^="env-"]').forEach(i=>{
-    data[i.id.replace('env-','')] = i.value;
+  // env-form 안의 input[id^="env-"] 만 수집 (사이드바 등 다른 요소 제외)
+  const form = document.getElementById('env-form');
+  if (!form) { toast('폼을 찾을 수 없음', 'err'); return; }
+  form.querySelectorAll('input[id^="env-"]').forEach(i => {
+    const key = i.id.slice('env-'.length);  // replace 대신 slice로 정확히 제거
+    if (key) data[key] = i.value;
   });
+  if (Object.keys(data).length === 0) {
+    toast('저장할 항목이 없음', 'err'); return;
+  }
   try {
     await api('PUT', `/api/env/${name}`, {data});
     clearDirty();
     document.getElementById('dirty-badge')?.classList.add('hidden');
-    toast(name+'.env 저장됨','ok');
+    toast(name+'.env 저장됨 ('+Object.keys(data).length+'개 항목)','ok');
   } catch(e) { toast('저장 실패: '+e.message,'err'); }
 }
 
