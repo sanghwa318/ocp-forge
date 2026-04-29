@@ -216,6 +216,11 @@ def parse_env(path):
 
 def write_env(path, data, original_path=None):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
+    # undefined / None 값 제거
+    data = {k: (v if v is not None else "") for k, v in data.items()
+            if k and isinstance(k, str) and re.match(r'^[A-Z_][A-Z0-9_]*$', k)}
+    if not data:
+        return
     # 기존 파일 백업 (.bak)
     if Path(path).exists():
         bak = str(path) + ".bak"
